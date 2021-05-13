@@ -30,6 +30,7 @@ import android.content.SharedPreferences;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.res.Configuration;
+import android.content.res.TypedArray;
 import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.Matrix;
@@ -132,6 +133,8 @@ import com.android.camera.util.VendorTagUtil;
 
 import org.codeaurora.snapcam.R;
 import org.codeaurora.snapcam.filter.ClearSightImageProcessor;
+
+import org.lineageos.quickreader.ScannerActivity;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -557,7 +560,7 @@ public class CaptureModule implements CameraModule, PhotoController,
     private boolean[] mCameraOpened = new boolean[MAX_NUM_CAM];
     private CameraDevice[] mCameraDevice = new CameraDevice[MAX_NUM_CAM];
     private String[] mCameraId = new String[MAX_NUM_CAM];
-    private String[] mSelectableModes = {"Video", "HFR", "Photo", "Bokeh", "SAT", "ProMode"};
+    private String[] mSelectableModes = {"Video", "HFR", "Photo", "Bokeh", "SAT", "ProMode", "QR"};
     private ArrayList<SceneModule> mSceneCameraIds = new ArrayList<>();
     private SceneModule mCurrentSceneMode;
     private int mNextModeIndex = 1;
@@ -570,7 +573,8 @@ public class CaptureModule implements CameraModule, PhotoController,
         DEFAULT,
         RTB,
         SAT,
-        PRO_MODE
+        PRO_MODE,
+        QR,
     }
 
     public enum MFNRSupportValues {
@@ -604,6 +608,7 @@ public class CaptureModule implements CameraModule, PhotoController,
     private boolean mExistAECWarmTag = true;
     private boolean mExistAECFrameControlTag = true;
 
+    private static final long SDCARD_SIZE_LIMIT = 4000 * 1024 * 1024L;
     private static final String sTempCropFilename = "crop-temp";
     private static final int REQUEST_CROP = 1000;
     private int mIntentMode = INTENT_MODE_NORMAL;
@@ -1824,6 +1829,10 @@ public class CaptureModule implements CameraModule, PhotoController,
                 if (!HFR_RATE.equals("")) {
                     mSettingsManager.setValue(SettingsManager.KEY_VIDEO_HIGH_FRAME_RATE, HFR_RATE);
                 }
+                if (!mSettingsManager.isHFRSupportedOnCurrentResolution()) {
+                    Toast.makeText(mActivity, R.string.hfr_unsupported_current_resolution,
+                            Toast.LENGTH_LONG).show();
+                }
                 createSessionForVideo(cameraId);
                 break;
             default:
@@ -2439,6 +2448,7 @@ public class CaptureModule implements CameraModule, PhotoController,
                 removeList[CameraMode.DEFAULT.ordinal()] = false;
                 removeList[CameraMode.VIDEO.ordinal()] = false;
                 removeList[CameraMode.PRO_MODE.ordinal()] = false;
+                removeList[CameraMode.QR.ordinal()] = false;
                 if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
                     CaptureModule.FRONT_ID = cameraId;
                     mSceneCameraIds.get(CameraMode.DEFAULT.ordinal()).frontCameraId = cameraId;
@@ -2454,6 +2464,7 @@ public class CaptureModule implements CameraModule, PhotoController,
                     mSceneCameraIds.get(CameraMode.DEFAULT.ordinal()).rearCameraId = cameraId;
                     mSceneCameraIds.get(CameraMode.VIDEO.ordinal()).rearCameraId = cameraId;
                     mSceneCameraIds.get(CameraMode.PRO_MODE.ordinal()).rearCameraId = cameraId;
+                    mSceneCameraIds.get(CameraMode.QR.ordinal()).rearCameraId = cameraId;
                     if (mSettingsManager.isHFRSupported()) { // filter HFR mode
                         removeList[CameraMode.HFR.ordinal()] = false;
                         mSceneCameraIds.get(CameraMode.HFR.ordinal()).rearCameraId = cameraId;
@@ -4575,6 +4586,7 @@ public class CaptureModule implements CameraModule, PhotoController,
             mSoundPlayer = SoundClips.getPlayer(mActivity);
         }
 
+        updateSaveStorageState();
         setDisplayOrientation();
         if (!resumeFromRestartAll) {
             startBackgroundThread();
@@ -4942,6 +4954,9 @@ public class CaptureModule implements CameraModule, PhotoController,
             return;
         }
         Log.d(TAG, "onSingleTapUp " + x + " " + y);
+
+        mUI.closeModeSwitcher(true);
+
         int currentId = mCurrentSceneMode.getCurrentId();
         if(mLockAFAE) {
             mLockAFAE = false;
@@ -5294,6 +5309,13 @@ public class CaptureModule implements CameraModule, PhotoController,
     @Override
     public void resizeForPreviewAspectRatio() {
 
+    }
+
+    @Override
+    public void onSwitchSavePath() {
+        mSettingsManager.setValue(SettingsManager.KEY_CAMERA_SAVEPATH, "1");
+        RotateTextToast.makeText(mActivity, R.string.on_switch_save_path_to_sdcard,
+                Toast.LENGTH_SHORT).show();
     }
 
     @Override
@@ -6495,7 +6517,12 @@ public class CaptureModule implements CameraModule, PhotoController,
         String title = createName(dateTaken);
         String filename = title + CameraUtil.convertOutputFormatToFileExt(outputFileFormat);
         String mime = CameraUtil.convertOutputFormatToMimeType(outputFileFormat);
-        String path = Storage.DIRECTORY + '/' + filename;
+        String path;
+        if (Storage.isSaveSDCard() && SDCard.instance().isWriteable()) {
+            path = SDCard.instance().getDirectory() + '/' + filename;
+        } else {
+            path = Storage.DIRECTORY + '/' + filename;
+        }
         mCurrentVideoValues = new ContentValues(9);
         mCurrentVideoValues.put(MediaStore.Video.Media.TITLE, title);
         mCurrentVideoValues.put(MediaStore.Video.Media.DISPLAY_NAME, filename);
@@ -6700,6 +6727,9 @@ public class CaptureModule implements CameraModule, PhotoController,
             maxFileSize = requestedSizeLimit;
         }
 
+        if (Storage.isSaveSDCard() && maxFileSize > SDCARD_SIZE_LIMIT) {
+            maxFileSize = SDCARD_SIZE_LIMIT;
+        }
         Log.i(TAG, "MediaRecorder setMaxFileSize: " + maxFileSize);
         try {
             mMediaRecorder.setMaxFileSize(maxFileSize);
@@ -6796,6 +6826,8 @@ public class CaptureModule implements CameraModule, PhotoController,
         }
 
         Log.d(TAG,"onShutterButtonClick");
+
+        mUI.closeModeSwitcher(true);
 
         if (mCurrentSceneMode.mode == CameraMode.HFR ||
                 mCurrentSceneMode.mode == CameraMode.VIDEO) {
@@ -8187,6 +8219,10 @@ public class CaptureModule implements CameraModule, PhotoController,
             }
             Log.d(TAG, "CaptureModule onSettingsChanged, key = " + key);
             switch (key) {
+                case SettingsManager.KEY_CAMERA_SAVEPATH:
+                    Storage.setSaveSDCard(value.equals("1"));
+                    mActivity.updateStorageSpaceAndHint();
+                    continue;
                 case SettingsManager.KEY_JPEG_QUALITY:
                     estimateJpegFileSize();
                     continue;
@@ -8653,7 +8689,7 @@ public class CaptureModule implements CameraModule, PhotoController,
         }
         mUI.showUIafterRecording();
         if (what == MediaRecorder.MEDIA_RECORDER_ERROR_UNKNOWN) {
-            // We may have run out of storage space.
+            // We may have run out of space on the sdcard.
             mActivity.updateStorageSpaceAndHint();
         } else {
            warningToast("MediaRecorder error. what=" + what + ". extra=" + extra);
@@ -8682,6 +8718,11 @@ public class CaptureModule implements CameraModule, PhotoController,
         byte[] bytes = new byte[buffer.remaining()];
         buffer.get(bytes);
         return bytes;
+    }
+
+    private void updateSaveStorageState() {
+        Storage.setSaveSDCard(mSettingsManager.getValue(SettingsManager
+                .KEY_CAMERA_SAVEPATH).equals("1"));
     }
 
     public void startPlayVideoActivity() {
@@ -8952,6 +8993,13 @@ public class CaptureModule implements CameraModule, PhotoController,
         if (mCurrentSceneMode.mode == mSceneCameraIds.get(mode).mode) {
             return -1;
         }
+        if (mSceneCameraIds.get(mode).mode == CameraMode.QR) {
+            mUI.closeModeSwitcher(true);
+            Intent intent = new Intent(mActivity, ScannerActivity.class);
+            mActivity.startActivity(intent);
+            // Don't change the selected item in modeswitcher
+            return -1;
+        }
         setCameraModeSwitcherAllowed(false);
         setNextSceneMode(mode);
         SceneModule nextSceneMode = mSceneCameraIds.get(mode);
@@ -8961,12 +9009,16 @@ public class CaptureModule implements CameraModule, PhotoController,
                  nextSceneMode.mode == CameraMode.SAT ||
                  nextSceneMode.mode == CameraMode.PRO_MODE)) {
             mSettingsManager.setValue(SettingsManager.KEY_FRONT_REAR_SWITCHER_VALUE, "rear");
+            mUI.setFrontBackSwitcherDrawable();
         } else {
             restartAll();
         }
         updateZoomSeekBarVisible();
         mUI.updateZoomSeekBar(1.0f);
         updateZoom();
+        mUI.closeModeSwitcher(true);
+        mUI.setCurrentModeIcon(mode);
+        mUI.setSwitcherAnimationNeeded(true);
         return 1;
     }
 
@@ -9004,6 +9056,16 @@ public class CaptureModule implements CameraModule, PhotoController,
         return mSelectableModes;
     }
 
+    public List<Integer> getCameraModeIconList() {
+        ArrayList<Integer> cameraModeIcons = new ArrayList<>();
+        TypedArray ic = mActivity.getResources()
+                .obtainTypedArray(R.array.camera_modes_back);
+        for (SceneModule sceneModule : mSceneCameraIds) {
+            cameraModeIcons.add(ic.getResourceId(sceneModule.mode.ordinal(), 0));
+        }
+        return cameraModeIcons;
+    }
+
     private class SceneModule {
         CameraMode mode = CameraMode.DEFAULT;
         public int rearCameraId;
@@ -9014,7 +9076,8 @@ public class CaptureModule implements CameraModule, PhotoController,
             int cameraId = isBackCamera() ? rearCameraId : frontCameraId;
             cameraId = isForceAUXOn(this.mode) ? auxCameraId : cameraId;
             if ((this.mode == CameraMode.DEFAULT || this.mode == CameraMode.VIDEO ||
-                      this.mode == CameraMode.HFR || this.mode == CameraMode.PRO_MODE)
+                      this.mode == CameraMode.HFR || this.mode == CameraMode.PRO_MODE ||
+                      this.mode == CameraMode.QR)
                     && (mSettingsManager.isDeveloperEnabled() || swithCameraId != -1)) {
                 String value = mSettingsManager.getValue(SettingsManager.KEY_SWITCH_CAMERA);
                 if (value != null && !value.equals("-1")) {
@@ -9031,7 +9094,8 @@ public class CaptureModule implements CameraModule, PhotoController,
             int cameraId = isBackCamera() ? rearCameraId : frontCameraId;
             cameraId = isForceAUXOn(this.mode) ? auxCameraId : cameraId;
             if ((this.mode == CameraMode.DEFAULT || this.mode == CameraMode.VIDEO ||
-                    this.mode == CameraMode.HFR || this.mode == CameraMode.PRO_MODE)
+                    this.mode == CameraMode.HFR || this.mode == CameraMode.PRO_MODE ||
+                    this.mode == CameraMode.QR)
                     && (mSettingsManager.isDeveloperEnabled() || swithCameraId != -1)) {
                 final SharedPreferences pref = mActivity.getSharedPreferences(
                         ComboPreferences.getLocalSharedPreferencesName(mActivity,
